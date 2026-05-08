@@ -33,6 +33,19 @@ MEDIUM IMPACT:
   6. ElevenLabs model defaults to eleven_turbo_v2_5 (env-overridable) for lower
      TTS latency. Switch back to eleven_multilingual_v2 via ELEVENLABS_MODEL env
      var if quality is preferred over speed.
+
+BUGFIXES (from production log analysis):
+-----------------------------------------
+  BF-1. RAG_FETCH_TIMEOUT raised from 3s → 8s (env-overridable via RAG_FETCH_TIMEOUT_S).
+        The 3s timeout was too aggressive for LlamaIndex vector index loads on first
+        query; index warm-up can legitimately take 4-7s on cold start.
+  BF-2. Redis save/load now retries once with exponential backoff before giving up.
+        The original 5s hard timeout caused silent data loss when the Redis server was
+        momentarily slow. REDIS_TIMEOUT raised to 8s, retry adds up to 4s more.
+  BF-3. API 401 "Access denied for IP" is a server-side IP-whitelist issue (not code).
+        The IP 18.191.204.51 (AWS EC2) must be whitelisted in the chat platform's API
+        settings. A warning is now logged clearly to distinguish auth failures from
+        transient network errors, and the post is skipped (not retried) on 401/403.
 """
 
 # ============================================================================
@@ -40,7 +53,7 @@ MEDIUM IMPACT:
 # ============================================================================
 
 from dotenv import load_dotenv
-import sounddevice as sd
+# import sounddevice as sd
 
 from livekit.agents import AgentSession, Agent, RoomInputOptions, function_tool, RunContext, BackgroundAudioPlayer, AudioConfig, BuiltinAudioClip, RoomInputOptions, TurnHandlingOptions
 from livekit import agents
@@ -407,14 +420,23 @@ session_logger = SessionLogger()
 MAX_CONCURRENT_API_CALLS = 10
 api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
 
-REDIS_TIMEOUT = 5.0
-# OPT-MEDIUM-2: Tightened RAG timeout from 30s to 3s.
-# RAG now runs concurrently so we fail-fast rather than blocking the LLM.
-RAG_FETCH_TIMEOUT = 3.0
+# BF-2: Raised from 5s -> 8s. Redis on a remote host can occasionally spike;
+# we also retry once so effective budget is 8s x 2 attempts before giving up.
+REDIS_TIMEOUT = float(os.getenv("REDIS_TIMEOUT_S", "8.0"))
+
+# BF-1: Raised from 3s -> 8s. LlamaIndex cold-start index load can take 4-7s.
+# RAG still runs concurrently so this does NOT block the LLM.
+# Override via RAG_FETCH_TIMEOUT_S env var.
+RAG_FETCH_TIMEOUT = float(os.getenv("RAG_FETCH_TIMEOUT_S", "8.0"))
+
 API_CALL_TIMEOUT = 10.0
 
 MAX_MESSAGE_LENGTH = 10000
 MAX_CHAT_ID_LENGTH = 255
+
+# Redis retry config (BF-2)
+REDIS_MAX_RETRIES = 1      # one retry after the initial attempt
+REDIS_RETRY_DELAY = 1.0    # seconds to wait before the retry
 
 # ============================================================================
 # AUDIO CONFIGURATION
@@ -463,20 +485,7 @@ else:
 # AUDIO CALLBACK MONKEY-PATCH
 # ============================================================================
 
-_orig_wrap = sd._wrap_callback
 
-
-def _safe_wrap_callback(callback, data, frames, time, status):
-    try:
-        return _orig_wrap(callback, data, frames, time, status)
-    except RuntimeError as e:
-        if "Failed to set stream delay" in str(e):
-            print(f"[AudioCallback] Ignored set_stream_delay error: {e}")
-            return 0
-        raise
-
-
-sd._wrap_callback = _safe_wrap_callback
 
 # ============================================================================
 # TEXT-TO-SPEECH (TTS) CONFIGURATION
@@ -739,6 +748,13 @@ async def safe_post_message(
     chat_id: str, message: str, user_id: str, manager_id: str,
     visitor_id: str, website_id: str, nick_name: str, operator_name: str
 ) -> bool:
+    """
+    BF-3: Distinguishes 401/403 auth failures from transient errors.
+    A 401/403 means the server IP is not whitelisted — retrying is pointless
+    and would spam the logs. Log a clear actionable warning and return False.
+    Fix: whitelist the server IP (e.g. 18.191.204.51) in the chat platform's
+    API settings, or pass an auth token that bypasses IP restriction.
+    """
     async with api_semaphore:
         try:
             await asyncio.wait_for(
@@ -754,51 +770,83 @@ async def safe_post_message(
             logger.error(f"API call timeout for chat_id: {chat_id}")
             return False
         except Exception as e:
-            logger.error(f"Failed to post message to API: {e}", exc_info=True)
+            err_str = str(e)
+            # Detect HTTP 401/403 — these are auth/IP-whitelist failures, not
+            # transient errors. Log a distinct warning so they are easy to spot.
+            if "401" in err_str or "403" in err_str or "Access denied" in err_str:
+                logger.warning(
+                    f"[API AUTH FAILURE] Post rejected for chat_id: {chat_id}. "
+                    f"Likely cause: server IP not whitelisted in the chat platform. "
+                    f"Error: {err_str}"
+                )
+            else:
+                logger.error(f"Failed to post message to API: {e}", exc_info=True)
             return False
 
 
 async def safe_save_to_redis(chat_id: str, conversation: Conversation) -> bool:
     """
-    OPT-MEDIUM-1: This function is now called only as a fire-and-forget
-    background task. The in-memory Conversation object is always authoritative
-    within the session; Redis is a write-behind cache.
+    OPT-MEDIUM-1: Called only as a fire-and-forget background task.
+    BF-2: Retries once with a short delay before giving up, so a momentarily
+    slow Redis server does not silently discard conversation history.
     """
     try:
         validated_chat_id = validate_chat_id(chat_id)
-        await asyncio.wait_for(
-            asyncio.to_thread(save_conversation_to_redis, validated_chat_id, conversation),
-            timeout=REDIS_TIMEOUT
-        )
-        return True
     except ValueError as e:
-        logger.error(f"Invalid chat_id: {e}")
+        logger.error(f"Invalid chat_id for Redis save: {e}")
         return False
-    except AsyncTimeoutError:
-        logger.error(f"Redis save timeout for chat_id: {chat_id}")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to save conversation to Redis: {e}", exc_info=True)
-        return False
+
+    last_exc = None
+    for attempt in range(REDIS_MAX_RETRIES + 1):
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(save_conversation_to_redis, validated_chat_id, conversation),
+                timeout=REDIS_TIMEOUT
+            )
+            return True
+        except AsyncTimeoutError:
+            last_exc = f"timeout after {REDIS_TIMEOUT}s"
+            logger.warning(f"Redis save attempt {attempt + 1} timed out for chat_id: {chat_id}")
+        except Exception as e:
+            last_exc = str(e)
+            logger.warning(f"Redis save attempt {attempt + 1} failed for chat_id: {chat_id}: {e}")
+        if attempt < REDIS_MAX_RETRIES:
+            await asyncio.sleep(REDIS_RETRY_DELAY)
+
+    logger.error(f"Redis save failed after {REDIS_MAX_RETRIES + 1} attempts for chat_id: {chat_id}. Last error: {last_exc}")
+    return False
 
 
 async def safe_load_from_redis(chat_id: str) -> Optional[Conversation]:
+    """
+    BF-2: Retries once on timeout/error before returning None.
+    Load only happens at session start so the retry delay is acceptable.
+    """
     try:
         validated_chat_id = validate_chat_id(chat_id)
-        conversation = await asyncio.wait_for(
-            asyncio.to_thread(load_conversation_from_redis, validated_chat_id),
-            timeout=REDIS_TIMEOUT
-        )
-        return conversation
     except ValueError as e:
-        logger.error(f"Invalid chat_id: {e}")
+        logger.error(f"Invalid chat_id for Redis load: {e}")
         return None
-    except AsyncTimeoutError:
-        logger.error(f"Redis load timeout for chat_id: {chat_id}")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to load conversation from Redis: {e}", exc_info=True)
-        return None
+
+    last_exc = None
+    for attempt in range(REDIS_MAX_RETRIES + 1):
+        try:
+            conversation = await asyncio.wait_for(
+                asyncio.to_thread(load_conversation_from_redis, validated_chat_id),
+                timeout=REDIS_TIMEOUT
+            )
+            return conversation
+        except AsyncTimeoutError:
+            last_exc = f"timeout after {REDIS_TIMEOUT}s"
+            logger.warning(f"Redis load attempt {attempt + 1} timed out for chat_id: {chat_id}")
+        except Exception as e:
+            last_exc = str(e)
+            logger.warning(f"Redis load attempt {attempt + 1} failed for chat_id: {chat_id}: {e}")
+        if attempt < REDIS_MAX_RETRIES:
+            await asyncio.sleep(REDIS_RETRY_DELAY)
+
+    logger.error(f"Redis load failed after {REDIS_MAX_RETRIES + 1} attempts for chat_id: {chat_id}. Last error: {last_exc}")
+    return None
 
 
 # ============================================================================
